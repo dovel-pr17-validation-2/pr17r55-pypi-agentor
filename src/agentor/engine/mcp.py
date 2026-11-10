@@ -1,0 +1,225 @@
+"""MCP client for the native engine.
+
+Built on the official `mcp` package rather than an agent framework's wrapper,
+so remote tools become ordinary `Tool` objects and the rest of the engine does
+not need to know where a tool came from.
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import AsyncExitStack
+from typing import Any, Callable, Dict, List, Optional
+
+import httpx2
+
+from agentor.engine.tools import Tool
+
+logger = logging.getLogger(__name__)
+
+
+def _content_to_text(result: Any) -> str:
+    """Flatten an MCP CallToolResult into the string a tool returns."""
+    parts: List[str] = []
+    for item in getattr(result, "content", None) or []:
+        text = getattr(item, "text", None)
+        if text is not None:
+            parts.append(text)
+            continue
+        # non-text content (images, resources) still needs to reach the model
+        # as something; its own repr is better than dropping it silently
+        parts.append(
+            str(item.model_dump(by_alias=True) if hasattr(item, "model_dump") else item)
+        )
+
+    if not parts and getattr(result, "structured_content", None) is not None:
+        return str(result.structured_content)
+    return "\n".join(parts)
+
+
+class MCPServer:
+    """A streamable-HTTP MCP server whose tools an agent can call.
+
+    Usable directly as an async context manager, or handed to `AgentLoop`,
+    which connects it for the duration of a run.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: float = 30.0,
+        name: Optional[str] = None,
+        tool_prefix: Optional[str] = None,
+        http_client_factory: Optional[Callable[..., httpx2.AsyncClient]] = None,
+    ):
+        self.url = url
+        self.headers = headers
+        self.timeout = timeout
+        self.name = name or url
+        #: guards against two servers exposing the same tool name
+        self.tool_prefix = tool_prefix
+        # Hosts can enforce endpoint/redirect policies without copying connect().
+        self.http_client_factory = http_client_factory or httpx2.AsyncClient
+        self._stack: Optional[AsyncExitStack] = None
+        self._session: Any = None
+        self._loop: Any = None
+
+    async def connect(self) -> List[Tool]:
+        import asyncio
+
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        if self._stack is not None:
+            # Overwriting _stack would make the first transport unclosable.
+            raise RuntimeError(
+                f"MCP server {self.name!r} is already connected. Call close() "
+                "first, or use a separate MCPServer per connection."
+            )
+
+        self._loop = asyncio.get_running_loop()
+        stack = AsyncExitStack()
+        try:
+            http_client = await stack.enter_async_context(
+                self.http_client_factory(
+                    headers=self.headers,
+                    timeout=httpx2.Timeout(self.timeout, read=300.0),
+                )
+            )
+            read, write = await stack.enter_async_context(
+                streamable_http_client(self.url, http_client=http_client)
+            )
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            self._stack = stack
+            self._session = session
+            # Discovery stays inside the guard: if it raises after the session
+            # opens, connect() never returns, so nothing else can close it.
+            return await self.list_tools()
+        except BaseException:
+            self._stack = None
+            self._session = None
+            self._loop = None
+            await stack.aclose()
+            raise
+
+    async def list_tools(self) -> List[Tool]:
+        from mcp.types import PaginatedRequestParams
+
+        if self._session is None:
+            raise RuntimeError(f"MCP server {self.name!r} is not connected.")
+
+        remote_tools = []
+        cursor = None
+        seen_cursors: set[str] = set()
+        while True:
+            listed = await self._session.list_tools(
+                params=PaginatedRequestParams(cursor=cursor) if cursor else None
+            )
+            remote_tools.extend(listed.tools)
+            # a paginated server returns the rest behind nextCursor; stopping at
+            # the first page would silently hide every tool after it
+            cursor = listed.next_cursor
+            if not cursor:
+                break
+            if cursor in seen_cursors:
+                raise RuntimeError(
+                    f"MCP server {self.name!r} repeated a pagination cursor."
+                )
+            seen_cursors.add(cursor)
+
+        tools: List[Tool] = []
+        for remote in remote_tools:
+            name = (
+                f"{self.tool_prefix}{remote.name}" if self.tool_prefix else remote.name
+            )
+            tools.append(
+                Tool(
+                    name=name,
+                    description=remote.description or "",
+                    parameters=remote.input_schema
+                    or {"type": "object", "properties": {}},
+                    invoke=self._invoker(remote.name),
+                )
+            )
+        return tools
+
+    def _invoker(self, remote_name: str):
+        async def invoke(**kwargs: Any) -> str:
+            result = await self._session.call_tool(remote_name, kwargs)
+            text = _content_to_text(result)
+            if result.is_error:
+                # raise so the loop's failure budget applies to remote tools too
+                raise RuntimeError(text or "MCP tool reported an error")
+            return text
+
+        return invoke
+
+    async def close(self) -> None:
+        if self._stack is None:
+            return
+
+        import asyncio
+
+        if self._loop is not None and self._loop is not asyncio.get_running_loop():
+            # anyio binds the session's cancel scope to the task that opened it.
+            # Closing from elsewhere raises "Attempted to exit cancel scope in a
+            # different task", which says nothing about the actual mistake.
+            # State is left intact so the caller can still close it correctly
+            # from the original loop; clearing it here would strand the session.
+            raise RuntimeError(
+                f"MCP server {self.name!r} was connected on a different event "
+                "loop than the one closing it. Connect and close within the "
+                "same asyncio.run(), or use `async with MCPServer(...)`."
+            )
+
+        try:
+            await self._stack.aclose()
+        except Exception as e:
+            logger.warning("Error closing MCP server %s: %s", self.name, e)
+        finally:
+            self._stack = None
+            self._session = None
+            self._loop = None
+
+    async def __aenter__(self) -> "MCPServer":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self.close()
+
+
+def MCPServerStreamableHttp(
+    name: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+    **_ignored: Any,
+) -> MCPServer:
+    """Compatibility shim for the constructor agentor exported before v0.1.0.
+
+    0.0.x code passes `params={"url": ..., "headers": ..., "timeout": ...}` and
+    options such as `cache_tools_list` that the native client does not need.
+    Failing on import would break those callers before they could read a
+    migration message, so the old call is translated instead.
+    """
+    import warnings
+
+    warnings.warn(
+        "MCPServerStreamableHttp is deprecated; use "
+        "agentor.mcp.MCPServer(url=..., headers=..., timeout=...) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    params = params or {}
+    url = params.get("url")
+    if not url:
+        raise ValueError("MCPServerStreamableHttp requires params={'url': ...}.")
+
+    return MCPServer(
+        url=url,
+        headers=params.get("headers"),
+        timeout=float(params.get("timeout") or 30.0),
+        name=name or url,
+    )
