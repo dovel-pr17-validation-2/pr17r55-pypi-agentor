@@ -24,7 +24,7 @@ dependencies = [
     "a2a-sdk>=0.3.10,<1.0",
     "typer>=0.20.0",
     "pytz>=2024.1",
-    "bm25s>=0.2.14",
+    "bm25s>=0.3.16",
     "pystemmer>=3.0.0",
 ]
 license-files = ["LICENSE"]
